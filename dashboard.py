@@ -1,54 +1,35 @@
 import asyncio
 import csv
 import json
-import shlex
 import socket
-import subprocess
-import sys
+import threading
 import time
 from io import StringIO
 from pathlib import Path
+from tkinter import filedialog, messagebox
 
-import streamlit as st
+import customtkinter as ctk
 from samsung_mdc import MDC
 
-ALL_CLI_COMMANDS = sorted(MDC._commands.keys())
 SAVED_DEVICES_FILE = Path("saved_devices.json")
 
-
-def load_saved_devices() -> list[dict]:
-    if not SAVED_DEVICES_FILE.exists():
-        return []
-    try:
-        raw = json.loads(SAVED_DEVICES_FILE.read_text(encoding="utf-8"))
-        if not isinstance(raw, list):
-            return []
-
-        cleaned = []
-        for item in raw:
-            if not isinstance(item, dict):
-                continue
-            ip = str(item.get("ip", "")).strip()
-            if not ip:
-                continue
-            cleaned.append(
-                {
-                    "ip": ip,
-                    "id": int(item.get("id", 0)),
-                    "site": str(item.get("site", "")).strip(),
-                    "description": str(item.get("description", "")).strip(),
-                }
-            )
-        return cleaned
-    except Exception:
-        return []
-
-
-def save_saved_devices(devices: list[dict]) -> None:
-    SAVED_DEVICES_FILE.write_text(
-        json.dumps(devices, ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
+POWER_MAP = {0: "OFF", 1: "ON", 2: "REBOOT"}
+MUTE_MAP = {0: "OFF", 1: "ON", 255: "UNAVAILABLE"}
+INPUT_SOURCE_MAP = {
+    0x18: "DVI",
+    0x21: "HDMI1",
+    0x23: "HDMI2",
+    0x25: "DISPLAY_PORT_1",
+    0x31: "HDMI3",
+    0x33: "HDMI4",
+}
+PICTURE_ASPECT_MAP = {
+    0x10: "PC_16_9",
+    0x18: "PC_4_3",
+    0x20: "PC_ORIGINAL_RATIO",
+    0x01: "VIDEO_16_9",
+    0x0B: "VIDEO_4_3",
+}
 
 
 def normalize_device(item: dict):
@@ -72,6 +53,27 @@ def normalize_device(item: dict):
     }
 
 
+def load_saved_devices() -> list[dict]:
+    if not SAVED_DEVICES_FILE.exists():
+        return []
+    try:
+        payload = json.loads(SAVED_DEVICES_FILE.read_text(encoding="utf-8"))
+        if isinstance(payload, dict):
+            payload = [payload]
+        if not isinstance(payload, list):
+            return []
+        return [d for d in (normalize_device(item) for item in payload) if d]
+    except Exception:
+        return []
+
+
+def save_saved_devices(devices: list[dict]) -> None:
+    SAVED_DEVICES_FILE.write_text(
+        json.dumps(devices, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+
 def parse_imported_devices(file_name: str, raw_bytes: bytes) -> list[dict]:
     lower_name = file_name.lower()
 
@@ -81,7 +83,7 @@ def parse_imported_devices(file_name: str, raw_bytes: bytes) -> list[dict]:
             payload = [payload]
         if not isinstance(payload, list):
             return []
-        return [device for device in (normalize_device(item) for item in payload) if device]
+        return [d for d in (normalize_device(item) for item in payload) if d]
 
     if lower_name.endswith(".csv"):
         text = raw_bytes.decode("utf-8")
@@ -129,187 +131,6 @@ def find_device_by_ip(devices: list[dict], ip: str):
     return None
 
 
-if "saved_devices" not in st.session_state:
-    st.session_state.saved_devices = load_saved_devices()
-
-if "ip_address" not in st.session_state:
-    st.session_state.ip_address = "192.168.1.50"
-
-if "port" not in st.session_state:
-    st.session_state.port = 1515
-
-if "display_id" not in st.session_state:
-    st.session_state.display_id = 0
-
-if "site" not in st.session_state:
-    st.session_state.site = ""
-
-if "description" not in st.session_state:
-    st.session_state.description = ""
-
-
-def apply_selected_device():
-    selected_ip = st.session_state.get("selected_device_ip", "(manual entry)")
-    if selected_ip == "(manual entry)":
-        return
-
-    selected = find_device_by_ip(st.session_state.saved_devices, selected_ip)
-    if not selected:
-        return
-
-    st.session_state.ip_address = selected.get("ip", st.session_state.ip_address)
-    st.session_state.display_id = int(selected.get("id", st.session_state.display_id))
-    st.session_state.site = selected.get("site", "")
-    st.session_state.description = selected.get("description", "")
-
-
-if "selected_device_ip" not in st.session_state:
-    st.session_state.selected_device_ip = "(manual entry)"
-
-
-def format_saved_option(option: str) -> str:
-    if option == "(manual entry)":
-        return option
-    device = find_device_by_ip(st.session_state.saved_devices, option)
-    if not device:
-        return option
-    site_name = device.get("site") or "No Site"
-    return f"{site_name} | {device.get('ip')} | ID {device.get('id', 0)}"
-
-st.set_page_config(page_title="Samsung Screen Control", page_icon="🖥️", layout="centered")
-st.title("Samsung MDC Dashboard")
-
-saved_device_options = ["(manual entry)", *[device["ip"] for device in st.session_state.saved_devices]]
-if st.session_state.selected_device_ip not in saved_device_options:
-    st.session_state.selected_device_ip = "(manual entry)"
-
-st.selectbox(
-    "Saved Devices",
-    options=saved_device_options,
-    key="selected_device_ip",
-    format_func=format_saved_option,
-    on_change=apply_selected_device,
-)
-
-ip_address = st.text_input("IP Address", key="ip_address").strip()
-port = st.number_input("Port", min_value=1, max_value=65535, step=1, key="port")
-display_id = st.number_input("Display ID", min_value=0, max_value=255, step=1, key="display_id")
-site = st.text_input("Site", key="site").strip()
-description = st.text_input("Description", key="description").strip()
-
-existing_saved_device = find_device_by_ip(st.session_state.saved_devices, ip_address)
-if ip_address and existing_saved_device is None:
-    if st.button("Save Device", use_container_width=True):
-        st.session_state.saved_devices.append(
-            {
-                "ip": ip_address,
-                "id": int(display_id),
-                "site": site,
-                "description": description,
-            }
-        )
-        save_saved_devices(st.session_state.saved_devices)
-        st.session_state.selected_device_ip = ip_address
-        st.success("Device saved")
-        st.rerun()
-elif existing_saved_device is not None:
-    st.caption("This IP is already saved in your list.")
-
-if st.session_state.saved_devices:
-    st.dataframe(
-        [
-            {
-                "IP": item.get("ip", ""),
-                "ID": item.get("id", 0),
-                "SITE": item.get("site", ""),
-                "DESCRIPTION": item.get("description", ""),
-            }
-            for item in st.session_state.saved_devices
-        ],
-        use_container_width=True,
-        hide_index=True,
-    )
-
-uploaded_file = st.file_uploader("Import Devices (JSON or CSV)", type=["json", "csv"])
-if uploaded_file is not None:
-    if st.button("Import Devices", use_container_width=True):
-        try:
-            imported_devices = parse_imported_devices(uploaded_file.name, uploaded_file.getvalue())
-            if not imported_devices:
-                st.warning("No valid devices found in file.")
-            else:
-                merged_devices, added_count, updated_count = merge_devices(
-                    st.session_state.saved_devices,
-                    imported_devices,
-                )
-                st.session_state.saved_devices = merged_devices
-                save_saved_devices(st.session_state.saved_devices)
-                st.success(f"Import complete: {added_count} added, {updated_count} updated.")
-                st.rerun()
-        except Exception as exc:
-            st.error(f"Import failed: {exc}")
-
-target = f"{ip_address}:{port}"
-
-
-def check_network_reachability(host: str, tcp_port: int, timeout: float = 1.5):
-    start_time = time.perf_counter()
-    try:
-        with socket.create_connection((host, int(tcp_port)), timeout=timeout):
-            elapsed_ms = int((time.perf_counter() - start_time) * 1000)
-            return True, f"Reachable in {elapsed_ms} ms"
-    except OSError as exc:
-        return False, str(exc)
-
-
-def render_network_light(host: str, tcp_port: int):
-    online, details = check_network_reachability(host, tcp_port)
-    light = "🟢" if online else "🔴"
-    state = "ONLINE" if online else "OFFLINE"
-    st.markdown(f"**TV Network:** {light} {state}")
-    st.caption(f"Checking {host}:{tcp_port} every 10s • {details}")
-
-
-if hasattr(st, "fragment"):
-    @st.fragment(run_every="10s")
-    def network_light_fragment():
-        render_network_light(ip_address, int(port))
-
-    network_light_fragment()
-else:
-    render_network_light(ip_address, int(port))
-
-
-POWER_MAP = {
-    0: "OFF",
-    1: "ON",
-    2: "REBOOT",
-}
-
-MUTE_MAP = {
-    0: "OFF",
-    1: "ON",
-    255: "UNAVAILABLE",
-}
-
-INPUT_SOURCE_MAP = {
-    0x18: "DVI",
-    0x21: "HDMI1",
-    0x23: "HDMI2",
-    0x25: "DISPLAY_PORT_1",
-    0x31: "HDMI3",
-    0x33: "HDMI4",
-}
-
-PICTURE_ASPECT_MAP = {
-    0x10: "PC_16_9",
-    0x18: "PC_4_3",
-    0x20: "PC_ORIGINAL_RATIO",
-    0x01: "VIDEO_16_9",
-    0x0B: "VIDEO_4_3",
-}
-
-
 def _label(code, mapping):
     if code is None:
         return "UNKNOWN"
@@ -318,14 +139,11 @@ def _label(code, mapping):
 
 def decode_status(raw_status):
     values = list(raw_status)
-
     power = values[0] if len(values) > 0 else None
     volume = values[1] if len(values) > 1 else None
     mute = values[2] if len(values) > 2 else None
     input_source = values[3] if len(values) > 3 else None
     picture_aspect = values[4] if len(values) > 4 else None
-    n_time_nf = values[5] if len(values) > 5 else None
-    f_time_nf = values[6] if len(values) > 6 else None
 
     return {
         "power": _label(power, POWER_MAP),
@@ -333,211 +151,946 @@ def decode_status(raw_status):
         "mute": _label(mute, MUTE_MAP),
         "input_source": _label(input_source, INPUT_SOURCE_MAP),
         "picture_aspect": _label(picture_aspect, PICTURE_ASPECT_MAP),
-        "n_time_nf": n_time_nf,
-        "f_time_nf": f_time_nf,
     }
 
 
-def diagnose_status_error(exc: Exception):
-    message = str(exc)
-    lower = message.lower()
+class SamsungDashboard(ctk.CTk):
+    def __init__(self):
+        super().__init__()
+        self.title("Samsung MDC Dashboard")
+        self.geometry("1220x780")
+        self.minsize(1100, 720)
 
-    if "response header read timeout" in lower:
-        return (
-            "TV network is reachable, but MDC did not answer status. "
-            "Possible causes: wrong Display ID, panel in deep standby, or Secured Protocol PIN required."
+        ctk.set_appearance_mode("Dark")
+        ctk.set_default_color_theme("blue")
+
+        # ── Colour palette (overridable per theme) ───────────────────────────
+        self._palette = {
+            "accent":       "#1f6aa5",
+            "accent_hover": "#1a5a8f",
+            "danger":       "#c0392b",
+            "danger_hover": "#a93226",
+            "success":      "#1e8449",
+            "success_hover":"#176339",
+            "warning":      "#d68910",
+            "warning_hover":"#b7770d",
+            "neutral":      "#2e4057",
+            "neutral_hover":"#253448",
+            "sidebar_bg":   "#1a1a2e",
+            "card_bg":      "#16213e",
+            "card2_bg":     "#0f3460",
+            "bar_bg":       "#0d0d1a",
+        }
+
+        self.saved_devices = load_saved_devices()
+
+        self.selected_device_var = ctk.StringVar(value="(manual entry)")
+        self.appearance_var = ctk.StringVar(value="Dark")
+        self.device_search_var = ctk.StringVar()
+
+        self.ip_var = ctk.StringVar(value="192.168.1.50")
+        self.port_var = ctk.StringVar(value="1515")
+        self.id_var = ctk.StringVar(value="0")
+        self.site_var = ctk.StringVar(value="")
+        self.description_var = ctk.StringVar(value="")
+
+        self.volume_var = ctk.IntVar(value=50)
+        self.brightness_var = ctk.IntVar(value=50)
+        self.mute_var = ctk.StringVar(value="OFF")
+        self.input_var = ctk.StringVar(value="HDMI1")
+
+        self.status_var = ctk.StringVar(value="Status: idle")
+        self.network_var = ctk.StringVar(value="Network: checking...")
+
+        self._all_cli_commands = sorted(MDC._commands.keys())
+        self.cli_command_var = ctk.StringVar(value=self._all_cli_commands[0] if self._all_cli_commands else "")
+        self.cli_arg_var = ctk.StringVar(value="")
+        self.cli_log_box: ctk.CTkTextbox | None = None
+        # dynamic per-field widgets rebuilt on command change
+        self._cli_arg_rows: list[dict] = []   # [{"var": StringVar, "enum": list|None}, ...]
+
+        self._build_ui()
+        self._refresh_saved_devices_menu()
+        self._schedule_network_check()
+
+    # ── UI helpers ────────────────────────────────────────────────────────────
+    def _btn(self, parent, text, command, color=None, hover=None, icon="", **kw):
+        p = self._palette
+        fg  = color or p["accent"]
+        hov = hover or p["accent_hover"]
+        lbl = f"{icon}  {text}" if icon else text
+        return ctk.CTkButton(
+            parent, text=lbl, command=command,
+            fg_color=fg, hover_color=hov,
+            corner_radius=8, font=ctk.CTkFont(size=12, weight="bold"),
+            **kw,
         )
-    if "connect timeout" in lower:
-        return "Cannot reach TV MDC service on network. Check IP/port/firewall and network path."
-    if "nak" in lower:
-        return "TV rejected command (NAK). Check model support, current input state, and command compatibility."
-    return message
 
+    def _card(self, parent, **kw):
+        return ctk.CTkFrame(
+            parent, corner_radius=12,
+            fg_color=self._palette["card_bg"],
+            border_width=1, border_color="#1e3a5f",
+            **kw,
+        )
 
-def probe_common_display_ids(ip: str, tcp_port: int, ids=(0, 1)):
-    results = []
-    target_to_probe = f"{ip}:{int(tcp_port)}"
+    def _section_label(self, parent, text):
+        return ctk.CTkLabel(
+            parent, text=text,
+            font=ctk.CTkFont(size=11, weight="bold"),
+            text_color="#7fb3d3",
+        )
 
-    async def _probe(id_to_try: int):
-        async with MDC(target_to_probe) as mdc:
-            return await mdc.status(id_to_try)
+    def _build_ui(self):
+        p = self._palette
+        self.configure(fg_color=p["bar_bg"])
+        self.grid_columnconfigure(1, weight=1)
+        self.grid_rowconfigure(0, weight=1)
+        self.grid_rowconfigure(1, weight=0)
 
-    for id_to_try in ids:
+        # ════════════════════════════════════════════════════════════════════
+        # SIDEBAR
+        # ════════════════════════════════════════════════════════════════════
+        sidebar = ctk.CTkFrame(self, width=290, corner_radius=0, fg_color=p["sidebar_bg"])
+        sidebar.grid(row=0, column=0, rowspan=2, sticky="nsew")
+        sidebar.grid_rowconfigure(6, weight=1)
+        sidebar.grid_columnconfigure(0, weight=1)
+
+        logo_frame = ctk.CTkFrame(sidebar, fg_color=p["card2_bg"], corner_radius=0)
+        logo_frame.grid(row=0, column=0, sticky="ew")
+        ctk.CTkLabel(logo_frame, text="🖥  SamsungPy",
+                     font=ctk.CTkFont(size=20, weight="bold"),
+                     text_color="#e8f4fd").grid(row=0, column=0, padx=20, pady=16, sticky="w")
+        ctk.CTkLabel(logo_frame, text="MDC Control Dashboard",
+                     font=ctk.CTkFont(size=11),
+                     text_color="#7fb3d3").grid(row=1, column=0, padx=20, pady=(0, 14), sticky="w")
+
+        self._section_label(sidebar, "  DEVICE MANAGEMENT").grid(
+            row=1, column=0, padx=16, pady=(14, 4), sticky="w")
+
+        mgmt = ctk.CTkFrame(sidebar, fg_color="transparent")
+        mgmt.grid(row=2, column=0, padx=12, pady=(0, 6), sticky="ew")
+        mgmt.grid_columnconfigure((0, 1), weight=1)
+        self._btn(mgmt, "Save",   self.save_current_device,   icon="💾", height=32).grid(row=0, column=0, padx=3, pady=3, sticky="ew")
+        self._btn(mgmt, "Delete", self.delete_selected_device, icon="🗑", color=p["danger"], hover=p["danger_hover"], height=32).grid(row=0, column=1, padx=3, pady=3, sticky="ew")
+        self._btn(mgmt, "Import", self.import_devices,         icon="📥", color=p["neutral"], hover=p["neutral_hover"], height=32).grid(row=1, column=0, padx=3, pady=3, sticky="ew")
+        self._btn(mgmt, "Export", self.export_devices,         icon="📤", color=p["neutral"], hover=p["neutral_hover"], height=32).grid(row=1, column=1, padx=3, pady=3, sticky="ew")
+
+        ctk.CTkFrame(sidebar, height=1, fg_color="#2a3a5e").grid(
+            row=3, column=0, sticky="ew", padx=16, pady=4)
+        self._section_label(sidebar, "  SAVED DEVICES").grid(
+            row=4, column=0, padx=16, pady=(6, 4), sticky="w")
+
+        search_entry = ctk.CTkEntry(
+            sidebar, textvariable=self.device_search_var,
+            placeholder_text="🔍  Search devices...",
+            fg_color=p["bar_bg"], border_color="#2a4f7a", corner_radius=8,
+            height=30,
+        )
+        search_entry.grid(row=5, column=0, padx=10, pady=(0, 4), sticky="ew")
+        self.device_search_var.trace_add("write", lambda *_: self._rebuild_devices_list())
+
+        self.devices_scroll = ctk.CTkScrollableFrame(
+            sidebar, fg_color="transparent", label_text="")
+        self.devices_scroll.grid(row=6, column=0, sticky="nsew", padx=8, pady=(0, 4))
+        self.devices_scroll.grid_columnconfigure(0, weight=1)
+
+        self.saved_device_menu = ctk.CTkOptionMenu(
+            sidebar, variable=self.selected_device_var,
+            values=["(manual entry)"], command=self._on_selected_device)
+
+        # ════════════════════════════════════════════════════════════════════
+        # MAIN AREA – tabview
+        # ════════════════════════════════════════════════════════════════════
+        tabs = ctk.CTkTabview(
+            self, corner_radius=12,
+            fg_color=p["bar_bg"],
+            segmented_button_fg_color=p["card2_bg"],
+            segmented_button_selected_color=p["accent"],
+            segmented_button_selected_hover_color=p["accent_hover"],
+            segmented_button_unselected_color=p["card2_bg"],
+            segmented_button_unselected_hover_color=p["neutral"],
+            text_color="#e8f4fd",
+        )
+        tabs.grid(row=0, column=1, padx=(0, 12), pady=(12, 4), sticky="nsew")
+        tabs.add("📟  Dashboard")
+        tabs.add("⌨️  CLI Commands")
+
+        tab_dash = tabs.tab("📟  Dashboard")
+        tab_cli  = tabs.tab("⌨️  CLI Commands")
+        tab_dash.grid_columnconfigure(0, weight=1)
+        tab_dash.grid_rowconfigure(4, weight=1)
+        tab_cli.grid_columnconfigure(0, weight=1)
+        tab_cli.grid_rowconfigure(3, weight=1)
+
+        # ── Bottom status bar ─────────────────────────────────────────────
+        status_bar = ctk.CTkFrame(self, height=32, corner_radius=0, fg_color=p["card2_bg"])
+        status_bar.grid(row=1, column=1, sticky="ew", padx=(0, 12), pady=(0, 4))
+        status_bar.grid_columnconfigure(1, weight=1)
+        self.net_dot = ctk.CTkLabel(status_bar, text="●", text_color="#e74c3c",
+                                    width=20, font=ctk.CTkFont(size=14))
+        self.net_dot.grid(row=0, column=0, padx=(10, 2), pady=4, sticky="w")
+        ctk.CTkLabel(status_bar, textvariable=self.network_var,
+                     text_color="#a0c4e0", font=ctk.CTkFont(size=11)).grid(
+            row=0, column=1, padx=4, pady=4, sticky="w")
+        ctk.CTkLabel(status_bar, textvariable=self.status_var,
+                     text_color="#7fb3d3", font=ctk.CTkFont(size=11)).grid(
+            row=0, column=2, padx=(0, 14), pady=4, sticky="e")
+
+        # ════════════════════════════════════════════════════════════════════
+        # TAB 1 – Dashboard
+        # ════════════════════════════════════════════════════════════════════
+
+        # Connection card
+        conn_card = self._card(tab_dash)
+        conn_card.grid(row=0, column=0, sticky="ew", padx=8, pady=(8, 5))
+        self._section_label(conn_card, "  CONNECTION").grid(
+            row=0, column=0, columnspan=6, padx=14, pady=(10, 4), sticky="w")
+        for c in range(6):
+            conn_card.grid_columnconfigure(c, weight=1)
+        for col, (label, var) in enumerate([
+            ("IP Address",  self.ip_var),
+            ("Port",        self.port_var),
+            ("Display ID",  self.id_var),
+            ("Site",        self.site_var),
+            ("Description", self.description_var),
+        ]):
+            ctk.CTkLabel(conn_card, text=label, font=ctk.CTkFont(size=11),
+                         text_color="#7fb3d3").grid(row=1, column=col, padx=8, pady=(0, 2), sticky="w")
+            ctk.CTkEntry(conn_card, textvariable=var,
+                         fg_color=p["bar_bg"], border_color="#2a4f7a",
+                         corner_radius=8).grid(row=2, column=col, padx=8, pady=(0, 10), sticky="ew")
+        self._btn(conn_card, "Check Status", self.get_status,
+                  icon="🔍", color=p["success"], hover=p["success_hover"],
+                  height=36).grid(row=2, column=5, padx=8, pady=(0, 10), sticky="ew")
+
+        # Quick actions card
+        qa_card = self._card(tab_dash)
+        qa_card.grid(row=1, column=0, sticky="ew", padx=8, pady=5)
+        self._section_label(qa_card, "  QUICK ACTIONS").grid(
+            row=0, column=0, columnspan=4, padx=14, pady=(10, 6), sticky="w")
+        for c in range(4):
+            qa_card.grid_columnconfigure(c, weight=1)
+        for col, (text, cmd, icon, clr, hov) in enumerate([
+            ("Reboot",         self.reboot_screen, "🔄", p["danger"],  p["danger_hover"]),
+            ("Get Serial",     self.get_serial,    "🔢", p["neutral"], p["neutral_hover"]),
+            ("Home (Content)", self.send_home_key, "🏠", p["accent"],  p["accent_hover"]),
+            ("Mute Toggle",    self.set_mute,      "🔇", p["warning"], p["warning_hover"]),
+        ]):
+            self._btn(qa_card, text, cmd, icon=icon, color=clr, hover=hov, height=38).grid(
+                row=1, column=col, padx=8, pady=(0, 10), sticky="ew")
+
+        # Controls card (volume + brightness)
+        ctrl_card = self._card(tab_dash)
+        ctrl_card.grid(row=2, column=0, sticky="ew", padx=8, pady=5)
+        self._section_label(ctrl_card, "  CONTROLS").grid(
+            row=0, column=0, columnspan=4, padx=14, pady=(10, 4), sticky="w")
+        ctrl_card.grid_columnconfigure((0, 1, 2, 3), weight=1)
+
+        self.vol_val_label = ctk.CTkLabel(ctrl_card, text="50", width=32,
+                                          font=ctk.CTkFont(size=12, weight="bold"),
+                                          text_color="#e8f4fd")
+        ctk.CTkLabel(ctrl_card, text="🔊  Volume",
+                     font=ctk.CTkFont(size=12), text_color="#a0c4e0").grid(
+            row=1, column=0, padx=(14, 4), pady=(0, 2), sticky="w")
+        self.vol_val_label.grid(row=1, column=1, padx=4, pady=(0, 2), sticky="w")
+        ctk.CTkSlider(ctrl_card, from_=0, to=100, variable=self.volume_var,
+                      progress_color=p["accent"], button_color=p["accent_hover"],
+                      command=lambda v: self.vol_val_label.configure(text=str(int(v)))
+                      ).grid(row=2, column=0, columnspan=2, padx=14, pady=(0, 4), sticky="ew")
+        self._btn(ctrl_card, "Set Volume", self.set_volume,
+                  icon="▶", height=32).grid(row=3, column=0, columnspan=2, padx=14, pady=(0, 10), sticky="ew")
+
+        self.bri_val_label = ctk.CTkLabel(ctrl_card, text="50", width=32,
+                                          font=ctk.CTkFont(size=12, weight="bold"),
+                                          text_color="#e8f4fd")
+        ctk.CTkLabel(ctrl_card, text="☀️  Brightness",
+                     font=ctk.CTkFont(size=12), text_color="#a0c4e0").grid(
+            row=1, column=2, padx=(14, 4), pady=(0, 2), sticky="w")
+        self.bri_val_label.grid(row=1, column=3, padx=4, pady=(0, 2), sticky="w")
+        ctk.CTkSlider(ctrl_card, from_=0, to=100, variable=self.brightness_var,
+                      progress_color=p["warning"], button_color=p["warning_hover"],
+                      command=lambda v: self.bri_val_label.configure(text=str(int(v)))
+                      ).grid(row=2, column=2, columnspan=2, padx=14, pady=(0, 4), sticky="ew")
+        self._btn(ctrl_card, "Set Brightness", self.set_brightness,
+                  icon="▶", color=p["warning"], hover=p["warning_hover"],
+                  height=32).grid(row=3, column=2, columnspan=2, padx=14, pady=(0, 10), sticky="ew")
+
+        # Input source card
+        inp_card = self._card(tab_dash)
+        inp_card.grid(row=3, column=0, sticky="ew", padx=8, pady=5)
+        self._section_label(inp_card, "  INPUT SOURCE").grid(
+            row=0, column=0, columnspan=3, padx=14, pady=(10, 4), sticky="w")
+        inp_card.grid_columnconfigure(1, weight=1)
+        ctk.CTkLabel(inp_card, text="Source:", text_color="#a0c4e0",
+                     font=ctk.CTkFont(size=12)).grid(row=1, column=0, padx=(14, 8), pady=(0, 10), sticky="w")
+        ctk.CTkOptionMenu(inp_card, variable=self.input_var,
+                          values=sorted(set(INPUT_SOURCE_MAP.values())),
+                          fg_color=p["bar_bg"], button_color=p["accent"],
+                          button_hover_color=p["accent_hover"],
+                          corner_radius=8).grid(row=1, column=1, padx=8, pady=(0, 10), sticky="ew")
+        self._btn(inp_card, "Set Input", self.set_input_source,
+                  icon="📡", height=34).grid(row=1, column=2, padx=14, pady=(0, 10), sticky="ew")
+
+        # Dashboard log
+        log_card = self._card(tab_dash)
+        log_card.grid(row=4, column=0, sticky="nsew", padx=8, pady=(5, 8))
+        log_card.grid_columnconfigure(0, weight=1)
+        log_card.grid_rowconfigure(1, weight=1)
+        self._section_label(log_card, "  ACTIVITY LOG").grid(
+            row=0, column=0, padx=14, pady=(10, 4), sticky="w")
+        self.log_box = ctk.CTkTextbox(
+            log_card, wrap="word", corner_radius=8,
+            fg_color=p["bar_bg"], border_width=0,
+            font=ctk.CTkFont(family="Consolas", size=12),
+            text_color="#a0c4e0",
+        )
+        self.log_box.grid(row=1, column=0, sticky="nsew", padx=10, pady=(0, 10))
+
+        # ════════════════════════════════════════════════════════════════════
+        # TAB 2 – CLI Commands
+        # ════════════════════════════════════════════════════════════════════
+
+        cli_top_card = self._card(tab_cli)
+        cli_top_card.grid(row=0, column=0, sticky="ew", padx=8, pady=(8, 5))
+        cli_top_card.grid_columnconfigure(1, weight=1)
+        self._section_label(cli_top_card, "  COMMAND").grid(
+            row=0, column=0, columnspan=3, padx=14, pady=(10, 4), sticky="w")
+        ctk.CTkLabel(cli_top_card, text="Search:", text_color="#a0c4e0",
+                     font=ctk.CTkFont(size=12)).grid(row=1, column=0, padx=(14, 6), pady=(0, 10), sticky="w")
+        self.cli_command_menu = ctk.CTkComboBox(
+            cli_top_card, variable=self.cli_command_var,
+            values=self._all_cli_commands,
+            command=self._on_cli_command_picked,
+            fg_color=p["bar_bg"], border_color="#2a4f7a",
+            button_color=p["accent"], button_hover_color=p["accent_hover"],
+            dropdown_fg_color=p["card_bg"], dropdown_hover_color=p["card2_bg"],
+            dropdown_text_color="#e8f4fd",
+            corner_radius=8,
+        )
+        self.cli_command_menu.grid(row=1, column=1, padx=8, pady=(0, 10), sticky="ew")
+        self.cli_command_menu.bind("<KeyRelease>", self._on_cli_search)
+        cli_btn_row = ctk.CTkFrame(cli_top_card, fg_color="transparent")
+        cli_btn_row.grid(row=1, column=2, padx=(0, 10), pady=(0, 10), sticky="e")
+        self._btn(cli_btn_row, "Get",  self.cli_get, icon="⬇", width=88, height=34).pack(side="left", padx=(0, 5))
+        self._btn(cli_btn_row, "Set",  self.cli_set, icon="⬆",
+                  color=p["success"], hover=p["success_hover"], width=88, height=34).pack(side="left", padx=(0, 5))
+        self._btn(cli_btn_row, "Clear",
+                  lambda: self.cli_log_box and self.cli_log_box.delete("1.0", "end"),
+                  color=p["neutral"], hover=p["neutral_hover"], width=88, height=34).pack(side="left")
+
+        args_card = self._card(tab_cli)
+        args_card.grid(row=1, column=0, sticky="ew", padx=8, pady=5)
+        args_card.grid_columnconfigure(0, weight=1)
+        self._section_label(args_card, "  ARGUMENTS").grid(
+            row=0, column=0, padx=14, pady=(10, 4), sticky="w")
+        self.cli_args_scroll = ctk.CTkScrollableFrame(
+            args_card, fg_color=p["bar_bg"], corner_radius=8, height=160)
+        self.cli_args_scroll.grid(row=1, column=0, sticky="ew", padx=10, pady=(0, 8))
+        self.cli_args_scroll.grid_columnconfigure(1, weight=1)
+        self.cli_args_scroll.grid_columnconfigure(3, weight=1)
+
+        manual_card = self._card(tab_cli)
+        manual_card.grid(row=2, column=0, sticky="ew", padx=8, pady=5)
+        manual_card.grid_columnconfigure(1, weight=1)
+        self._section_label(manual_card, "  MANUAL OVERRIDE  (optional)").grid(
+            row=0, column=0, columnspan=3, padx=14, pady=(10, 4), sticky="w")
+        ctk.CTkLabel(manual_card, text="Values:", text_color="#a0c4e0",
+                     font=ctk.CTkFont(size=12)).grid(row=1, column=0, padx=(14, 6), pady=(0, 10), sticky="w")
+        self.cli_arg_entry = ctk.CTkEntry(
+            manual_card, textvariable=self.cli_arg_var,
+            placeholder_text="comma-separated — overrides pickers above, e.g.  ON,50",
+            fg_color=p["bar_bg"], border_color="#2a4f7a", corner_radius=8,
+        )
+        self.cli_arg_entry.grid(row=1, column=1, columnspan=2, padx=(0, 14), pady=(0, 10), sticky="ew")
+
+        cli_log_card = self._card(tab_cli)
+        cli_log_card.grid(row=3, column=0, sticky="nsew", padx=8, pady=(5, 8))
+        cli_log_card.grid_columnconfigure(0, weight=1)
+        cli_log_card.grid_rowconfigure(1, weight=1)
+        self._section_label(cli_log_card, "  COMMAND OUTPUT").grid(
+            row=0, column=0, padx=14, pady=(10, 4), sticky="w")
+        self.cli_log_box = ctk.CTkTextbox(
+            cli_log_card, wrap="word", corner_radius=8,
+            fg_color=p["bar_bg"], border_width=0,
+            font=ctk.CTkFont(family="Consolas", size=12),
+            text_color="#a0c4e0",
+        )
+        self.cli_log_box.grid(row=1, column=0, sticky="nsew", padx=10, pady=(0, 10))
+
+        self._on_cli_command_picked(self.cli_command_var.get())
+        self.log("Dashboard ready.")
+
+    def log(self, text: str):
+        timestamp = time.strftime("%H:%M:%S")
+        self.log_box.insert("end", f"[{timestamp}] {text}\n")
+        self.log_box.see("end")
+
+    def cli_log(self, text: str):
+        if not self.cli_log_box:
+            return
+        timestamp = time.strftime("%H:%M:%S")
+        self.cli_log_box.insert("end", f"[{timestamp}] {text}\n")
+        self.cli_log_box.see("end")
+
+    @staticmethod
+    def _field_placeholder(field) -> str:
+        """Return a helpful placeholder string based on the field type."""
+        t = type(field).__name__
+        range_ = getattr(field, "range", None)
+        if t in ("Int", "Int+range"):
+            if range_:
+                lo, hi = range_.start, range_.stop - 1
+                return f"int  ({lo}–{hi})"
+            return "integer"
+        if t == "Bool":
+            return "ON | OFF (or 1 / 0)"
+        if t == "Time":
+            return "HH:MM  e.g. 08:30"
+        if t == "Time12H":
+            return "HH:MM  e.g. 08:30  (12-h clock)"
+        if t == "DateTime":
+            return "YYYY-MM-DD HH:MM  or  YYYY-MM-DD HH:MM:SS"
+        if t == "IPAddress":
+            return "e.g. 192.168.1.50"
+        if t == "VideoWallModel":
+            return "X,Y  e.g. 2,2"
+        if t in ("Str", "StrCoded"):
+            return "text string"
+        if t == "Bitmask":
+            enum = getattr(field, "enum", None)
+            if enum:
+                return "comma-sep list: " + ",".join(m.name for m in list(enum)[:3]) + "..."
+        return "value"
+
+    def _on_cli_search(self, event=None):
+        """Filter the combobox dropdown list as the user types."""
+        typed = self.cli_command_var.get().lower()
+        filtered = [c for c in self._all_cli_commands if typed in c.lower()]
+        self.cli_command_menu.configure(values=filtered if filtered else self._all_cli_commands)
+        # auto-pick if the typed text is an exact match
+        if typed in (c.lower() for c in self._all_cli_commands):
+            exact = next(c for c in self._all_cli_commands if c.lower() == typed)
+            self._on_cli_command_picked(exact)
+
+    def _on_cli_command_picked(self, command_name: str):
+        """Rebuild per-field argument rows for the chosen command."""
+        for widget in self.cli_args_scroll.winfo_children():
+            widget.destroy()
+        self._cli_arg_rows.clear()
+
+        command = MDC._commands.get(command_name)
+        data_fields = getattr(command, "DATA", []) if command else []
+
+        if not data_fields:
+            ctk.CTkLabel(
+                self.cli_args_scroll,
+                text="No arguments — read-only command, use  Get  to query.",
+                text_color="gray",
+            ).grid(row=0, column=0, columnspan=4, padx=8, pady=6, sticky="w")
+            return
+
+        for row_idx, field in enumerate(data_fields):
+            fname  = getattr(field, "name", f"arg{row_idx}")
+            enum   = getattr(field, "enum", None)
+            ftype  = type(field).__name__
+            range_ = getattr(field, "range", None)
+
+            # Build list of valid enum choices (works for Enum and Bitmask)
+            enum_names = [m.name for m in enum] if enum else []
+
+            # type annotation shown next to the field name
+            if range_:
+                lo, hi = range_.start, range_.stop - 1
+                type_hint = f"int  {lo}–{hi}"
+            elif ftype == "Bool":
+                type_hint = "bool"
+            elif ftype in ("Time", "Time12H"):
+                type_hint = "HH:MM"
+            elif ftype == "DateTime":
+                type_hint = "datetime"
+            elif ftype == "IPAddress":
+                type_hint = "IP"
+            elif ftype == "VideoWallModel":
+                type_hint = "X,Y"
+            elif ftype in ("Str", "StrCoded"):
+                type_hint = "str"
+            elif ftype == "Bitmask":
+                type_hint = "list(,)"
+            elif enum_names:
+                type_hint = "enum"
+            else:
+                type_hint = ftype
+
+            default = enum_names[0] if enum_names else ""
+            var = ctk.StringVar(value=default)
+            self._cli_arg_rows.append({"var": var, "enum": enum_names, "type": ftype})
+
+            # ── field name + type label ──────────────────────────────────────
+            label_text = f"{fname}\n({type_hint})"
+            ctk.CTkLabel(
+                self.cli_args_scroll,
+                text=label_text,
+                font=ctk.CTkFont(size=11, weight="bold"),
+                width=145,
+                anchor="w",
+                justify="left",
+            ).grid(row=row_idx, column=0, padx=(8, 4), pady=4, sticky="w")
+
+            if enum_names:
+                # ── enum / bitmask: dropdown + manual entry ──────────────────
+                ctk.CTkOptionMenu(
+                    self.cli_args_scroll,
+                    variable=var,
+                    values=enum_names,
+                    width=180,
+                ).grid(row=row_idx, column=1, padx=4, pady=4, sticky="ew")
+
+                ctk.CTkLabel(
+                    self.cli_args_scroll,
+                    text="or type:",
+                    text_color="gray",
+                    width=55,
+                ).grid(row=row_idx, column=2, padx=(6, 2), pady=4, sticky="w")
+
+                ctk.CTkEntry(
+                    self.cli_args_scroll,
+                    textvariable=var,
+                    placeholder_text=self._field_placeholder(field),
+                ).grid(row=row_idx, column=3, padx=(0, 8), pady=4, sticky="ew")
+
+            else:
+                # ── free-entry: plain text with smart placeholder ────────────
+                ctk.CTkEntry(
+                    self.cli_args_scroll,
+                    textvariable=var,
+                    placeholder_text=self._field_placeholder(field),
+                ).grid(row=row_idx, column=1, columnspan=3, padx=(4, 8), pady=4, sticky="ew")
+
+    def _collect_cli_args(self) -> tuple:
+        """Build args tuple: manual override wins if non-empty, else use per-field rows.
+
+        For Int-typed fields the string value is cast to int so the library's
+        pack() method receives the correct type.
+        """
+        raw_manual = self.cli_arg_var.get().strip()
+        if raw_manual:
+            return tuple(part.strip() for part in raw_manual.split(",") if part.strip())
+
+        result = []
+        for row in self._cli_arg_rows:
+            val = row["var"].get().strip()
+            if not val:
+                continue
+            # coerce numeric strings to int for Int fields
+            if row.get("type") in ("Int",) and val.lstrip("-").isdigit():
+                val = int(val)
+            result.append(val)
+        return tuple(result)
+
+    def cli_get(self):
+        command_name = self.cli_command_var.get().strip()
+        if not command_name:
+            return
+
+        command = MDC._commands.get(command_name)
+        if command and not getattr(command, 'GET', False):
+            self.cli_log(f"{command_name}: this command does not support GET (read).")
+            return
+
+        async def _worker(mdc: MDC, display_id: int):
+            method = getattr(mdc, command_name)
+            return await method(display_id)
+
+        def _on_success(result):
+            self.cli_log(f"{command_name} → {result}")
+            self.log(f"CLI GET {command_name} OK")
+
+        def _on_error(exc):
+            self.cli_log(f"{command_name} GET failed: {exc}")
+            self.status_var.set(f"Status: CLI GET {command_name} failed")
+
+        self.status_var.set(f"Status: CLI GET {command_name}...")
+
+        def _thread():
+            try:
+                result = asyncio.run(self._execute_mdc(_worker))
+                self.after(0, lambda: _on_success(result))
+            except Exception as exc:
+                self.after(0, lambda: _on_error(exc))
+
+        threading.Thread(target=_thread, daemon=True).start()
+
+    def cli_set(self):
+        command_name = self.cli_command_var.get().strip()
+        if not command_name:
+            return
+
+        command = MDC._commands.get(command_name)
+        if command and not getattr(command, 'SET', False):
+            self.cli_log(f"{command_name}: this command does not support SET (write).")
+            return
+
+        # timer_15 / timer_13 require an extra timer_id positional argument
+        if command_name in ('timer_15', 'timer_13'):
+            self.cli_log(f"{command_name}: use the CLI terminal for timer commands (requires timer_id).")
+            return
+
+        args_tuple = self._collect_cli_args()
+
+        async def _worker(mdc: MDC, display_id: int):
+            method = getattr(mdc, command_name)
+            return await method(display_id, args_tuple)
+
+        def _on_success(result):
+            self.cli_log(f"{command_name}({', '.join(str(a) for a in args_tuple)}) → {result}")
+            self.log(f"CLI SET {command_name} OK")
+
+        def _on_error(exc):
+            self.cli_log(f"{command_name} SET failed: {exc}")
+            self.status_var.set(f"Status: CLI SET {command_name} failed")
+
+        self.status_var.set(f"Status: CLI SET {command_name}...")
+
+        def _thread():
+            try:
+                result = asyncio.run(self._execute_mdc(_worker))
+                self.after(0, lambda: _on_success(result))
+            except Exception as exc:
+                self.after(0, lambda: _on_error(exc))
+
+        threading.Thread(target=_thread, daemon=True).start()
+
+    def _validate_connection_fields(self) -> tuple[str, int, int]:
+        ip = self.ip_var.get().strip()
+        if not ip:
+            raise ValueError("IP is required")
+
         try:
-            _ = run_async(_probe(id_to_try))
-            results.append((id_to_try, True, "OK"))
-        except Exception as probe_exc:
-            results.append((id_to_try, False, str(probe_exc)))
-    return results
+            port = int(self.port_var.get().strip())
+        except Exception as exc:
+            raise ValueError("Port must be a number") from exc
 
+        try:
+            display_id = int(self.id_var.get().strip())
+        except Exception as exc:
+            raise ValueError("Display ID must be a number") from exc
 
-async def mdc_call(coro):
-    async with MDC(target) as mdc:
-        return await coro(mdc)
+        return ip, port, display_id
 
+    async def _execute_mdc(self, worker):
+        ip, port, display_id = self._validate_connection_fields()
+        target = f"{ip}:{port}"
+        async with MDC(target) as mdc:
+            return await worker(mdc, display_id)
 
-def run_async(coro):
-    return asyncio.run(coro)
+    def _run_async_action(self, action_name: str, worker, on_success=None):
+        self.status_var.set(f"Status: {action_name}...")
 
+        def _thread_target():
+            try:
+                result = asyncio.run(self._execute_mdc(worker))
+                self.after(0, lambda: self._action_success(action_name, result, on_success))
+            except Exception as exc:
+                self.after(0, lambda: self._action_error(action_name, exc))
 
-def get_command_argument_options(command_name: str):
-    command = MDC._commands.get(command_name)
-    if not command:
-        return []
+        threading.Thread(target=_thread_target, daemon=True).start()
 
-    data_fields = getattr(command, "DATA", [])
-    if len(data_fields) != 1:
-        return []
+    def _action_success(self, action_name: str, result, on_success=None):
+        self.status_var.set(f"Status: {action_name} OK")
+        self.log(f"{action_name} succeeded")
+        if on_success:
+            on_success(result)
 
-    field = data_fields[0]
-    if hasattr(field, "enum") and getattr(field, "enum") is not None:
-        return [member.name for member in field.enum]
+    def _action_error(self, action_name: str, exc: Exception):
+        self.status_var.set(f"Status: {action_name} failed")
+        self.log(f"{action_name} failed: {exc}")
 
-    return []
+    def _refresh_saved_devices_menu(self):
+        values = ["(manual entry)"] + [device["ip"] for device in self.saved_devices]
+        if self.selected_device_var.get() not in values:
+            self.selected_device_var.set("(manual entry)")
+        self.saved_device_menu.configure(values=values)
+        self._rebuild_devices_list()
 
+    def _rebuild_devices_list(self):
+        """Repopulate the scrollable sidebar device list, honoring the search filter."""
+        for widget in self.devices_scroll.winfo_children():
+            widget.destroy()
 
-col1, col2 = st.columns(2)
+        p = self._palette
+        needle = self.device_search_var.get().lower().strip()
+        visible = [
+            d for d in self.saved_devices
+            if not needle
+            or needle in (d.get("ip", "")).lower()
+            or needle in (d.get("site", "")).lower()
+            or needle in (d.get("description", "")).lower()
+            or needle in str(d.get("id", "")).lower()
+        ]
 
-if col1.button("Get Status", use_container_width=True):
-    try:
-        status = run_async(mdc_call(lambda mdc: mdc.status(display_id)))
-        decoded_status = decode_status(status)
-        st.success("Status fetched")
-        st.json(decoded_status)
-        with st.expander("Show raw status values"):
-            st.json(status)
-    except Exception as exc:
-        st.error(diagnose_status_error(exc))
+        if not self.saved_devices:
+            ctk.CTkLabel(
+                self.devices_scroll,
+                text="No saved devices yet.",
+                text_color="#7fb3d3",
+                font=ctk.CTkFont(size=12),
+            ).grid(row=0, column=0, padx=8, pady=16)
+            return
 
-        with st.expander("Troubleshooting details"):
-            st.write(f"Selected Display ID: {display_id}")
-            st.write(f"Raw error: {exc}")
+        if not visible:
+            ctk.CTkLabel(
+                self.devices_scroll,
+                text="No devices match the search.",
+                text_color="#7fb3d3",
+                font=ctk.CTkFont(size=12),
+            ).grid(row=0, column=0, padx=8, pady=16)
+            return
 
-            probe_results = probe_common_display_ids(ip_address, int(port), ids=(0, 1))
-            probe_summary = {
-                f"id_{id_to_try}": "OK" if ok else f"Fail: {err}"
-                for id_to_try, ok, err in probe_results
+        for row_idx, device in enumerate(visible):
+            ip   = device.get("ip", "")
+            did  = device.get("id", 0)
+            site = device.get("site") or ip
+            desc = device.get("description", "")
+
+            is_selected = self.selected_device_var.get() == ip
+            card_color  = p["card2_bg"] if is_selected else p["card_bg"]
+            border_col  = p["accent"]   if is_selected else "#1e3a5f"
+
+            card = ctk.CTkFrame(self.devices_scroll, corner_radius=10,
+                                fg_color=card_color,
+                                border_width=1, border_color=border_col)
+            card.grid(row=row_idx, column=0, padx=4, pady=4, sticky="ew")
+            card.grid_columnconfigure(0, weight=1)
+
+            # site + IP labels
+            info = ctk.CTkFrame(card, fg_color="transparent")
+            info.grid(row=0, column=0, padx=10, pady=(6, 2), sticky="w")
+            ctk.CTkLabel(info, text=site,
+                         font=ctk.CTkFont(size=12, weight="bold"),
+                         text_color="#e8f4fd").pack(anchor="w")
+            ctk.CTkLabel(info, text=f"{ip}  ·  ID {did}" + (f"  ·  {desc}" if desc else ""),
+                         font=ctk.CTkFont(size=10), text_color="#7fb3d3").pack(anchor="w")
+
+            btns = ctk.CTkFrame(card, fg_color="transparent")
+            btns.grid(row=1, column=0, padx=8, pady=(2, 8), sticky="ew")
+            btns.grid_columnconfigure((0, 1), weight=1)
+
+            def _make_select(captured_ip=ip):
+                def _select():
+                    self.selected_device_var.set(captured_ip)
+                    self._on_selected_device(captured_ip)
+                    self._rebuild_devices_list()
+                return _select
+
+            def _make_connect(captured_ip=ip):
+                def _connect():
+                    self.selected_device_var.set(captured_ip)
+                    self._on_selected_device(captured_ip)
+                    self._rebuild_devices_list()
+                    self.get_status()
+                return _connect
+
+            ctk.CTkButton(
+                btns, text="Select", height=26, corner_radius=6,
+                fg_color=p["neutral"], hover_color=p["neutral_hover"],
+                font=ctk.CTkFont(size=11),
+                command=_make_select(),
+            ).grid(row=0, column=0, padx=(0, 4), sticky="ew")
+            ctk.CTkButton(
+                btns, text="⚡ Connect", height=26, corner_radius=6,
+                fg_color=p["success"], hover_color=p["success_hover"],
+                font=ctk.CTkFont(size=11, weight="bold"),
+                command=_make_connect(),
+            ).grid(row=0, column=1, sticky="ew")
+
+        self.devices_scroll.grid_columnconfigure(0, weight=1)
+
+    def _on_selected_device(self, selected_ip: str):
+        if selected_ip == "(manual entry)":
+            return
+        selected = find_device_by_ip(self.saved_devices, selected_ip)
+        if not selected:
+            return
+        self.ip_var.set(selected.get("ip", ""))
+        self.id_var.set(str(selected.get("id", 0)))
+        self.site_var.set(selected.get("site", ""))
+        self.description_var.set(selected.get("description", ""))
+
+    def save_current_device(self):
+        candidate = normalize_device(
+            {
+                "ip": self.ip_var.get(),
+                "id": self.id_var.get(),
+                "site": self.site_var.get(),
+                "description": self.description_var.get(),
             }
-            st.json(probe_summary)
-
-if col2.button("Reboot", use_container_width=True):
-    try:
-        run_async(mdc_call(lambda mdc: mdc.power(display_id, ("REBOOT",))))
-        st.success("Reboot command sent")
-    except Exception as exc:
-        st.error(str(exc))
-
-if st.button("Capture Screenshot", use_container_width=True):
-    try:
-        def do_capture(mdc):
-            if not hasattr(mdc, "screen_capture"):
-                raise RuntimeError(
-                    "Screenshot is not supported by this installed python-samsung-mdc version/device."
-                )
-            return mdc.screen_capture(display_id)
-
-        image_data = run_async(mdc_call(do_capture))
-        output_path = Path("screen_view.jpg")
-        output_path.write_bytes(image_data)
-        st.success(f"Saved screenshot to {output_path}")
-        st.image(image_data, caption="Live Screen View")
-    except Exception as exc:
-        st.error(str(exc))
-
-st.subheader("Quick Controls")
-
-volume = st.slider("Volume", min_value=0, max_value=100, value=25)
-if st.button("Set Volume", use_container_width=True):
-    try:
-        run_async(mdc_call(lambda mdc: mdc.volume(display_id, (volume,))))
-        st.success(f"Volume set to {volume}")
-    except Exception as exc:
-        st.error(str(exc))
-
-source_labels = {
-    "HDMI 1": "HDMI1",
-    "HDMI 2": "HDMI2",
-    "DVI": "DVI",
-    "DisplayPort 1": "DISPLAY_PORT_1",
-}
-source_label = st.selectbox("Input Source", options=list(source_labels.keys()))
-source = source_labels[source_label]
-if st.button("Set Input", use_container_width=True):
-    try:
-        run_async(mdc_call(lambda mdc: mdc.input_source(display_id, (source,))))
-        st.success(f"Input set to {source_label}")
-    except Exception as exc:
-        st.error(str(exc))
-
-mute_state = st.selectbox("Mute", options=["ON", "OFF"])
-if st.button("Set Mute", use_container_width=True):
-    try:
-        run_async(mdc_call(lambda mdc: mdc.mute(display_id, (mute_state,))))
-        st.success(f"Mute set to {mute_state}")
-    except Exception as exc:
-        st.error(str(exc))
-
-brightness = st.slider("Brightness", min_value=0, max_value=100, value=80)
-if st.button("Set Brightness", use_container_width=True):
-    try:
-        run_async(mdc_call(lambda mdc: mdc.brightness(display_id, (brightness,))))
-        st.success(f"Brightness set to {brightness}")
-    except Exception as exc:
-        st.error(str(exc))
-
-if st.button("Get Serial Number", use_container_width=True):
-    try:
-        serial = run_async(mdc_call(lambda mdc: mdc.serial_number(display_id)))
-        st.info(f"Serial: {serial}")
-    except Exception as exc:
-        st.error(str(exc))
-
-if st.button("Remote: Home (KEY_CONTENT)", use_container_width=True):
-    try:
-        run_async(mdc_call(lambda mdc: mdc.virtual_remote(display_id, ("KEY_CONTENT",))))
-        st.success("Sent KEY_CONTENT")
-    except Exception as exc:
-        st.error(str(exc))
-
-st.subheader("Advanced CLI Command")
-st.caption("Choose a command, then optionally add arguments (example args: on, HDMI1, KEY_CONTENT)")
-
-selected_command = st.selectbox("CLI Command", options=ALL_CLI_COMMANDS, index=ALL_CLI_COMMANDS.index("status") if "status" in ALL_CLI_COMMANDS else 0)
-
-argument_options = get_command_argument_options(selected_command)
-selected_argument_option = st.selectbox(
-    "Argument Dropdown",
-    options=["(none)", *argument_options],
-    index=0,
-)
-command_args = st.text_input("Arguments (optional)", value="")
-
-if st.button("Run Advanced Command", use_container_width=True):
-    try:
-        effective_args = command_args.strip()
-        if not effective_args and selected_argument_option != "(none)":
-            effective_args = selected_argument_option
-
-        parsed_args = shlex.split(effective_args) if effective_args else []
-        cli_target = f"{display_id}@{ip_address}:{int(port)}"
-        cli_cmd = [sys.executable, "-m", "samsung_mdc", cli_target, selected_command, *parsed_args]
-        result = subprocess.run(
-            cli_cmd,
-            capture_output=True,
-            text=True,
-            timeout=25,
-            check=False,
         )
+        if not candidate:
+            messagebox.showerror("Invalid device", "Please enter a valid IP.")
+            return
 
-        if result.returncode == 0:
-            st.success("Command executed")
+        existing = find_device_by_ip(self.saved_devices, candidate["ip"])
+        if existing:
+            existing.update(candidate)
+            self.log(f"Updated saved device {candidate['ip']}")
         else:
-            st.error(f"Command failed (exit code {result.returncode})")
+            self.saved_devices.append(candidate)
+            self.log(f"Saved new device {candidate['ip']}")
 
-        if result.stdout.strip():
-            st.text_area("Output", value=result.stdout, height=160)
+        save_saved_devices(self.saved_devices)
+        self.selected_device_var.set(candidate["ip"])
+        self._refresh_saved_devices_menu()
 
-        if result.stderr.strip():
-            st.text_area("Errors", value=result.stderr, height=120)
-    except Exception as exc:
-        st.error(str(exc))
+    def delete_selected_device(self):
+        selected_ip = self.selected_device_var.get()
+        if selected_ip == "(manual entry)":
+            return
+
+        before = len(self.saved_devices)
+        self.saved_devices = [device for device in self.saved_devices if device.get("ip") != selected_ip]
+        if len(self.saved_devices) == before:
+            return
+
+        save_saved_devices(self.saved_devices)
+        self.selected_device_var.set("(manual entry)")
+        self._refresh_saved_devices_menu()
+        self.log(f"Deleted saved device {selected_ip}")
+
+    def import_devices(self):
+        file_path = filedialog.askopenfilename(
+            title="Import devices",
+            filetypes=[("JSON files", "*.json"), ("CSV files", "*.csv")],
+        )
+        if not file_path:
+            return
+
+        path = Path(file_path)
+        try:
+            imported = parse_imported_devices(path.name, path.read_bytes())
+            if not imported:
+                messagebox.showwarning("Import", "No valid devices found in file.")
+                return
+
+            merged, added_count, updated_count = merge_devices(self.saved_devices, imported)
+            self.saved_devices = merged
+            save_saved_devices(self.saved_devices)
+            self._refresh_saved_devices_menu()
+            self.log(f"Import complete: {added_count} added, {updated_count} updated")
+        except Exception as exc:
+            messagebox.showerror("Import failed", str(exc))
+
+    def export_devices(self):
+        if not self.saved_devices:
+            messagebox.showinfo("Export", "No devices to export.")
+            return
+
+        file_path = filedialog.asksaveasfilename(
+            title="Export devices",
+            defaultextension=".json",
+            filetypes=[("JSON files", "*.json")],
+        )
+        if not file_path:
+            return
+
+        Path(file_path).write_text(json.dumps(self.saved_devices, ensure_ascii=False, indent=2), encoding="utf-8")
+        self.log(f"Exported {len(self.saved_devices)} devices")
+
+    def _schedule_network_check(self):
+        def _check():
+            ip = self.ip_var.get().strip()
+            if not ip:
+                self.network_var.set("Network: no IP")
+            else:
+                try:
+                    port = int(self.port_var.get().strip())
+                    start = time.perf_counter()
+                    with socket.create_connection((ip, port), timeout=1.5):
+                        elapsed = int((time.perf_counter() - start) * 1000)
+                        self.network_var.set(f"Network: ONLINE ({elapsed} ms)")
+                except Exception:
+                    self.network_var.set("Network: OFFLINE")
+            self.after(10000, self._schedule_network_check)
+
+        threading.Thread(target=lambda: self.after(0, _check), daemon=True).start()
+
+    def get_status(self):
+        async def _worker(mdc: MDC, display_id: int):
+            return await mdc.status(display_id)
+
+        def _on_success(result):
+            decoded = decode_status(result)
+            self.log(
+                "Power: {power}, Volume: {volume}, Mute: {mute}, Input: {input_source}, Aspect: {picture_aspect}".format(
+                    **decoded
+                )
+            )
+
+        self._run_async_action("Status", _worker, _on_success)
+
+    def get_serial(self):
+        async def _worker(mdc: MDC, display_id: int):
+            return await mdc.serial_number(display_id)
+
+        self._run_async_action("Serial", _worker, lambda serial: self.log(f"Serial: {serial}"))
+
+    def reboot_screen(self):
+        async def _worker(mdc: MDC, display_id: int):
+            await mdc.power(display_id, ("REBOOT",))
+            return None
+
+        self._run_async_action("Reboot", _worker)
+
+    def send_home_key(self):
+        async def _worker(mdc: MDC, display_id: int):
+            await mdc.virtual_remote(display_id, ("KEY_CONTENT",))
+            return None
+
+        self._run_async_action("KEY_CONTENT", _worker)
+
+    def set_volume(self):
+        value = int(self.volume_var.get())
+
+        async def _worker(mdc: MDC, display_id: int):
+            await mdc.volume(display_id, (value,))
+            return value
+
+        self._run_async_action("Set volume", _worker, lambda result: self.log(f"Volume set to {result}"))
+
+    def set_brightness(self):
+        value = int(self.brightness_var.get())
+
+        async def _worker(mdc: MDC, display_id: int):
+            await mdc.brightness(display_id, (value,))
+            return value
+
+        self._run_async_action("Set brightness", _worker, lambda result: self.log(f"Brightness set to {result}"))
+
+    def set_input_source(self):
+        source = self.input_var.get().strip()
+
+        async def _worker(mdc: MDC, display_id: int):
+            await mdc.input_source(display_id, (source,))
+            return source
+
+        self._run_async_action("Set input", _worker, lambda result: self.log(f"Input source set to {result}"))
+
+    def set_mute(self):
+        current = self.mute_var.get().strip().upper()
+        next_state = "ON" if current != "ON" else "OFF"
+        self.mute_var.set(next_state)
+
+        async def _worker(mdc: MDC, display_id: int):
+            await mdc.mute(display_id, (next_state,))
+            return next_state
+
+        self._run_async_action("Mute", _worker, lambda result: self.log(f"Mute set to {result}"))
+
+
+def main() -> None:
+    app = SamsungDashboard()
+    app.mainloop()
+
+
+if __name__ == "__main__":
+    main()

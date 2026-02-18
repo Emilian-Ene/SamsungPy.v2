@@ -1,2 +1,2 @@
 python-samsung-mdc
-streamlit
+customtkinter

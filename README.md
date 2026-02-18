@@ -29,50 +29,32 @@ py screen_control.py --ip 192.168.1.50 --reboot
 py screen_control.py --ip 192.168.1.50 --no-screenshot
 ```
 
-## Web dashboard
+## Desktop dashboard (CustomTkinter)
 
-Run directly (auto-opens your default web browser):
+Run directly:
 
 ```bash
 py launch_dashboard.py
 ```
 
-If port `8501` is already in use, the launcher automatically selects a free localhost port.
-
-Alternative manual run:
-
-```bash
-py -m streamlit run dashboard.py
-```
-
-VS Code task:
-
-- Run `Terminal > Run Task > Launch Samsung Dashboard`.
-
 This gives you buttons for status, reboot, volume, input source, mute, brightness, serial number, and `KEY_CONTENT` (Home equivalent).
 
-## Build EXE (Windows)
+## Build EXE (Windows, Nuitka)
 
-Create a standalone Windows app folder:
+Install build dependencies:
 
 ```bash
-build_exe.bat
+py -m pip install -U nuitka zstandard ordered-set
 ```
 
-Output:
+Build single-file EXE:
 
-- `dist\SamsungMDCDashboard\SamsungMDCDashboard.exe`
+```bash
+py -m nuitka --onefile --standalone --windows-console-mode=disable --output-filename=SamsungMDCDashboard.exe launch_dashboard.py
+```
 
-You can copy the full `dist\SamsungMDCDashboard` folder to another PC and run the EXE.
+Output EXE is created in the Nuitka output folder shown in terminal.
 
 ## Build Installer (optional)
 
-If you want a setup wizard (`.exe` installer):
-
-1. Install **Inno Setup**.
-2. Open `installer_inno_setup.iss`.
-3. Click **Build**.
-
-Output installer:
-
-- `installer\SamsungMDCDashboard-Setup.exe`
+If you want a setup wizard (`.exe` installer), create the EXE first with Nuitka, then package it with your installer tool of choice (for example Inno Setup).
