@@ -1,22 +1,253 @@
 import asyncio
+import csv
+import json
 import shlex
 import socket
 import subprocess
 import sys
 import time
+from io import StringIO
 from pathlib import Path
 
 import streamlit as st
 from samsung_mdc import MDC
 
 ALL_CLI_COMMANDS = sorted(MDC._commands.keys())
+SAVED_DEVICES_FILE = Path("saved_devices.json")
+
+
+def load_saved_devices() -> list[dict]:
+    if not SAVED_DEVICES_FILE.exists():
+        return []
+    try:
+        raw = json.loads(SAVED_DEVICES_FILE.read_text(encoding="utf-8"))
+        if not isinstance(raw, list):
+            return []
+
+        cleaned = []
+        for item in raw:
+            if not isinstance(item, dict):
+                continue
+            ip = str(item.get("ip", "")).strip()
+            if not ip:
+                continue
+            cleaned.append(
+                {
+                    "ip": ip,
+                    "id": int(item.get("id", 0)),
+                    "site": str(item.get("site", "")).strip(),
+                    "description": str(item.get("description", "")).strip(),
+                }
+            )
+        return cleaned
+    except Exception:
+        return []
+
+
+def save_saved_devices(devices: list[dict]) -> None:
+    SAVED_DEVICES_FILE.write_text(
+        json.dumps(devices, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+
+def normalize_device(item: dict):
+    if not isinstance(item, dict):
+        return None
+
+    ip = str(item.get("ip", "")).strip()
+    if not ip:
+        return None
+
+    try:
+        device_id = int(item.get("id", 0))
+    except Exception:
+        device_id = 0
+
+    return {
+        "ip": ip,
+        "id": device_id,
+        "site": str(item.get("site", "")).strip(),
+        "description": str(item.get("description", "")).strip(),
+    }
+
+
+def parse_imported_devices(file_name: str, raw_bytes: bytes) -> list[dict]:
+    lower_name = file_name.lower()
+
+    if lower_name.endswith(".json"):
+        payload = json.loads(raw_bytes.decode("utf-8"))
+        if isinstance(payload, dict):
+            payload = [payload]
+        if not isinstance(payload, list):
+            return []
+        return [device for device in (normalize_device(item) for item in payload) if device]
+
+    if lower_name.endswith(".csv"):
+        text = raw_bytes.decode("utf-8")
+        reader = csv.DictReader(StringIO(text))
+        parsed = []
+        for row in reader:
+            mapped = {
+                "ip": row.get("ip") or row.get("IP") or "",
+                "id": row.get("id") or row.get("ID") or 0,
+                "site": row.get("site") or row.get("SITE") or "",
+                "description": row.get("description") or row.get("DESCRIPTION") or "",
+            }
+            normalized = normalize_device(mapped)
+            if normalized:
+                parsed.append(normalized)
+        return parsed
+
+    return []
+
+
+def merge_devices(existing_devices: list[dict], incoming_devices: list[dict]) -> tuple[list[dict], int, int]:
+    merged = list(existing_devices)
+    index_by_ip = {device.get("ip"): idx for idx, device in enumerate(merged)}
+    added = 0
+    updated = 0
+
+    for device in incoming_devices:
+        ip = device.get("ip")
+        if ip in index_by_ip:
+            merged[index_by_ip[ip]] = device
+            updated += 1
+        else:
+            index_by_ip[ip] = len(merged)
+            merged.append(device)
+            added += 1
+
+    return merged, added, updated
+
+
+def find_device_by_ip(devices: list[dict], ip: str):
+    ip_to_find = ip.strip()
+    for device in devices:
+        if device.get("ip") == ip_to_find:
+            return device
+    return None
+
+
+if "saved_devices" not in st.session_state:
+    st.session_state.saved_devices = load_saved_devices()
+
+if "ip_address" not in st.session_state:
+    st.session_state.ip_address = "192.168.1.50"
+
+if "port" not in st.session_state:
+    st.session_state.port = 1515
+
+if "display_id" not in st.session_state:
+    st.session_state.display_id = 0
+
+if "site" not in st.session_state:
+    st.session_state.site = ""
+
+if "description" not in st.session_state:
+    st.session_state.description = ""
+
+
+def apply_selected_device():
+    selected_ip = st.session_state.get("selected_device_ip", "(manual entry)")
+    if selected_ip == "(manual entry)":
+        return
+
+    selected = find_device_by_ip(st.session_state.saved_devices, selected_ip)
+    if not selected:
+        return
+
+    st.session_state.ip_address = selected.get("ip", st.session_state.ip_address)
+    st.session_state.display_id = int(selected.get("id", st.session_state.display_id))
+    st.session_state.site = selected.get("site", "")
+    st.session_state.description = selected.get("description", "")
+
+
+if "selected_device_ip" not in st.session_state:
+    st.session_state.selected_device_ip = "(manual entry)"
+
+
+def format_saved_option(option: str) -> str:
+    if option == "(manual entry)":
+        return option
+    device = find_device_by_ip(st.session_state.saved_devices, option)
+    if not device:
+        return option
+    site_name = device.get("site") or "No Site"
+    return f"{site_name} | {device.get('ip')} | ID {device.get('id', 0)}"
 
 st.set_page_config(page_title="Samsung Screen Control", page_icon="🖥️", layout="centered")
 st.title("Samsung MDC Dashboard")
 
-ip_address = st.text_input("IP Address", value="192.168.1.50")
-port = st.number_input("Port", min_value=1, max_value=65535, value=1515, step=1)
-display_id = st.number_input("Display ID", min_value=0, max_value=255, value=0, step=1)
+saved_device_options = ["(manual entry)", *[device["ip"] for device in st.session_state.saved_devices]]
+if st.session_state.selected_device_ip not in saved_device_options:
+    st.session_state.selected_device_ip = "(manual entry)"
+
+st.selectbox(
+    "Saved Devices",
+    options=saved_device_options,
+    key="selected_device_ip",
+    format_func=format_saved_option,
+    on_change=apply_selected_device,
+)
+
+ip_address = st.text_input("IP Address", key="ip_address").strip()
+port = st.number_input("Port", min_value=1, max_value=65535, step=1, key="port")
+display_id = st.number_input("Display ID", min_value=0, max_value=255, step=1, key="display_id")
+site = st.text_input("Site", key="site").strip()
+description = st.text_input("Description", key="description").strip()
+
+existing_saved_device = find_device_by_ip(st.session_state.saved_devices, ip_address)
+if ip_address and existing_saved_device is None:
+    if st.button("Save Device", use_container_width=True):
+        st.session_state.saved_devices.append(
+            {
+                "ip": ip_address,
+                "id": int(display_id),
+                "site": site,
+                "description": description,
+            }
+        )
+        save_saved_devices(st.session_state.saved_devices)
+        st.session_state.selected_device_ip = ip_address
+        st.success("Device saved")
+        st.rerun()
+elif existing_saved_device is not None:
+    st.caption("This IP is already saved in your list.")
+
+if st.session_state.saved_devices:
+    st.dataframe(
+        [
+            {
+                "IP": item.get("ip", ""),
+                "ID": item.get("id", 0),
+                "SITE": item.get("site", ""),
+                "DESCRIPTION": item.get("description", ""),
+            }
+            for item in st.session_state.saved_devices
+        ],
+        use_container_width=True,
+        hide_index=True,
+    )
+
+uploaded_file = st.file_uploader("Import Devices (JSON or CSV)", type=["json", "csv"])
+if uploaded_file is not None:
+    if st.button("Import Devices", use_container_width=True):
+        try:
+            imported_devices = parse_imported_devices(uploaded_file.name, uploaded_file.getvalue())
+            if not imported_devices:
+                st.warning("No valid devices found in file.")
+            else:
+                merged_devices, added_count, updated_count = merge_devices(
+                    st.session_state.saved_devices,
+                    imported_devices,
+                )
+                st.session_state.saved_devices = merged_devices
+                save_saved_devices(st.session_state.saved_devices)
+                st.success(f"Import complete: {added_count} added, {updated_count} updated.")
+                st.rerun()
+        except Exception as exc:
+            st.error(f"Import failed: {exc}")
 
 target = f"{ip_address}:{port}"
 
