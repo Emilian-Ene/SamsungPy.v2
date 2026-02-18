@@ -4,9 +4,15 @@ import json
 import socket
 import threading
 import time
-from io import StringIO
+from io import BytesIO, StringIO
 from pathlib import Path
 from tkinter import filedialog, messagebox
+
+try:
+    from PIL import Image, ImageTk
+    _PIL_AVAILABLE = True
+except ImportError:
+    _PIL_AVAILABLE = False
 
 import customtkinter as ctk
 from samsung_mdc import MDC
@@ -368,15 +374,15 @@ class SamsungDashboard(ctk.CTk):
         qa_card = self._card(tab_dash)
         qa_card.grid(row=1, column=0, sticky="ew", padx=8, pady=5)
         self._section_label(qa_card, "  QUICK ACTIONS").grid(
-            row=0, column=0, columnspan=4, padx=14, pady=(10, 6), sticky="w")
-        for c in range(4):
-            qa_card.grid_columnconfigure(c, weight=1)
+            row=0, column=0, columnspan=5, padx=14, pady=(10, 6), sticky="w")
         for col, (text, cmd, icon, clr, hov) in enumerate([
-            ("Reboot",         self.reboot_screen, "🔄", p["danger"],  p["danger_hover"]),
-            ("Get Serial",     self.get_serial,    "🔢", p["neutral"], p["neutral_hover"]),
-            ("Home (Content)", self.send_home_key, "🏠", p["accent"],  p["accent_hover"]),
-            ("Mute Toggle",    self.set_mute,      "🔇", p["warning"], p["warning_hover"]),
+            ("Reboot",         self.reboot_screen,  "🔄", p["danger"],  p["danger_hover"]),
+            ("Get Serial",     self.get_serial,     "🔢", p["neutral"], p["neutral_hover"]),
+            ("Home (Content)", self.send_home_key,  "🏠", p["accent"],  p["accent_hover"]),
+            ("Mute Toggle",    self.set_mute,       "🔇", p["warning"], p["warning_hover"]),
+            ("Screenshot",     self.take_screenshot, "📸", p["success"], p["success_hover"]),
         ]):
+            qa_card.grid_columnconfigure(col, weight=1)
             self._btn(qa_card, text, cmd, icon=icon, color=clr, hover=hov, height=38).grid(
                 row=1, column=col, padx=8, pady=(0, 10), sticky="ew")
 
@@ -1085,6 +1091,69 @@ class SamsungDashboard(ctk.CTk):
             return next_state
 
         self._run_async_action("Mute", _worker, lambda result: self.log(f"Mute set to {result}"))
+
+    def take_screenshot(self):
+        """Capture a screenshot from the Samsung display and show/save it."""
+        async def _worker(mdc: MDC, display_id: int):
+            if not hasattr(mdc, "screen_capture"):
+                raise RuntimeError("screen_capture is not supported by this python-samsung-mdc version or device.")
+            return await mdc.screen_capture(display_id)
+
+        def _on_success(image_bytes: bytes):
+            # Save to disk
+            ip = self.ip_var.get().strip().replace(".", "_")
+            ts = time.strftime("%Y%m%d_%H%M%S")
+            out_path = Path(f"screenshot_{ip}_{ts}.jpg")
+            out_path.write_bytes(image_bytes)
+            self.log(f"Screenshot saved: {out_path}")
+
+            # Show preview popup
+            if not _PIL_AVAILABLE:
+                messagebox.showinfo("Screenshot", f"Saved to {out_path}\n(Install Pillow to enable preview)")
+                return
+
+            try:
+                img = Image.open(BytesIO(image_bytes))
+                img.thumbnail((960, 600))
+
+                popup = ctk.CTkToplevel(self)
+                popup.title(f"Screenshot – {self.ip_var.get()}")
+                popup.grab_set()
+
+                photo = ImageTk.PhotoImage(img)
+                # keep reference so GC doesn't destroy it
+                popup._photo_ref = photo
+
+                import tkinter as tk
+                lbl = tk.Label(popup, image=photo, bg="#0d0d1a")
+                lbl.pack(padx=10, pady=10)
+
+                def _save_as():
+                    dest = filedialog.asksaveasfilename(
+                        title="Save screenshot",
+                        defaultextension=".jpg",
+                        initialfile=out_path.name,
+                        filetypes=[("JPEG", "*.jpg"), ("PNG", "*.png"), ("All files", "*.*")],
+                    )
+                    if dest:
+                        Path(dest).write_bytes(image_bytes)
+                        self.log(f"Screenshot saved as: {dest}")
+
+                btn_row = ctk.CTkFrame(popup, fg_color="transparent")
+                btn_row.pack(pady=(0, 10))
+                ctk.CTkButton(btn_row, text="💾  Save As…", command=_save_as,
+                              fg_color=self._palette["accent"],
+                              hover_color=self._palette["accent_hover"],
+                              width=130, height=32).pack(side="left", padx=6)
+                ctk.CTkButton(btn_row, text="Close", command=popup.destroy,
+                              fg_color=self._palette["neutral"],
+                              hover_color=self._palette["neutral_hover"],
+                              width=90, height=32).pack(side="left", padx=6)
+            except Exception as exc:
+                self.log(f"Screenshot preview error: {exc}")
+                messagebox.showinfo("Screenshot", f"Saved to {out_path}")
+
+        self._run_async_action("Screenshot", _worker, _on_success)
 
 
 def main() -> None:
